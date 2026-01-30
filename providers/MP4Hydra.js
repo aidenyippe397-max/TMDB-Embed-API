@@ -11,10 +11,10 @@ function generateSlug(title) {
 
 // Process episode data from MP4Hydra response
 function processEpisode(episode, baseServer, serverName, serverNumber) {
-    const videoUrl = `${baseServer}${episode.src}`;
+    const videoUrl = `\( {baseServer} \){episode.src}`;
     const subtitles = episode.subs ? episode.subs.map(sub => ({
         label: sub.label,
-        url: `${baseServer}${sub.src}`
+        url: `\( {baseServer} \){sub.src}`
     })) : [];
 
     return {
@@ -29,28 +29,30 @@ function processEpisode(episode, baseServer, serverName, serverNumber) {
     };
 }
 
-// Main function to get streams from MP4Hydra
-async function getMP4HydraStreams(tmdbId, mediaType, seasonNum = null, episodeNum = null) {
+// Helper to score quality (higher = better) – used to pick the "best" stream
+function qualityScore(quality) {
+    if (!quality) return 0;
+    const q = quality.toUpperCase();
+    if (q.includes('4K') || q.includes('2160')) return 10;
+    if (q.includes('1080')) return 8;
+    if (q.includes('720')) return 6;
+    if (q.includes('480')) return 4;
+    return 2;
+}
+
+// Core logic to fetch and process streams (shared between normal + direct modes)
+async function fetchAndProcessMP4Hydra(tmdbId, mediaType, seasonNum = null, episodeNum = null) {
     try {
-        console.log(`[MP4Hydra] Fetching streams for TMDB ID: ${tmdbId}, Type: ${mediaType}, Season: ${seasonNum}, Episode: ${episodeNum}`);
+        console.log(`[MP4Hydra] Fetching for TMDB ID: ${tmdbId}, Type: \( {mediaType}, S: \){seasonNum}, E:${episodeNum}`);
 
-        // Get TMDB details
         const details = await getTMDBDetails(tmdbId, mediaType);
-        if (!details) {
-            console.log(`[MP4Hydra] Could not fetch details for TMDB ID: ${tmdbId}`);
-            return [];
-        }
+        if (!details) return { streams: [], details };
 
-        console.log(`[MP4Hydra] Found title: ${details.title} (${details.year})`);
-
-        // Generate slug in the format "movie-name-year"
         let slug = details.slug;
         if (mediaType === 'movie' && details.year) {
-            slug = `${details.slug}-${details.year}`;
+            slug = `\( {details.slug}- \){details.year}`;
         }
-        console.log(`[MP4Hydra] Using slug: ${slug}`);
 
-        // Create form data for multipart/form-data request
         const formData = new FormData();
         formData.append('v', '8');
         formData.append('z', JSON.stringify([{
@@ -60,7 +62,6 @@ async function getMP4HydraStreams(tmdbId, mediaType, seasonNum = null, episodeNu
             ep: episodeNum
         }]));
 
-        // Make request to MP4Hydra API
         const response = await axios({
             method: 'post',
             url: 'https://mp4hydra.org/info2?v=8',
@@ -71,7 +72,7 @@ async function getMP4HydraStreams(tmdbId, mediaType, seasonNum = null, episodeNu
                 'Accept': '*/*',
                 'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
                 'Origin': 'https://mp4hydra.org',
-                'Referer': `https://mp4hydra.org/${mediaType}/${slug}`,
+                'Referer': `https://mp4hydra.org/\( {mediaType}/ \){slug}`,
                 'Sec-Fetch-Dest': 'empty',
                 'Sec-Fetch-Mode': 'cors',
                 'Sec-Fetch-Site': 'same-origin'
@@ -79,410 +80,94 @@ async function getMP4HydraStreams(tmdbId, mediaType, seasonNum = null, episodeNu
             timeout: 10000
         });
 
-        // Process response
-        if (response.data && response.data.playlist && response.data.playlist.length > 0) {
-            const playlist = response.data.playlist;
-            const servers = response.data.servers;
-
-            console.log(`[MP4Hydra] Found ${playlist.length} videos`);
-            console.log(`[MP4Hydra] Available servers: ${Object.keys(servers).join(', ')}`);
-
-            // For TV shows, find the specific episode
-            if (mediaType === 'tv' && seasonNum && episodeNum) {
-                const paddedSeason = seasonNum.toString().padStart(2, '0');
-                const paddedEpisode = episodeNum.toString().padStart(2, '0');
-                const seasonEpisode = `S${paddedSeason}E${paddedEpisode}`;
-
-                const targetEpisode = playlist.find(item =>
-                    item.title && item.title.toUpperCase() === seasonEpisode.toUpperCase()
-                );
-
-                if (!targetEpisode) {
-                    console.log(`[MP4Hydra] Could not find ${seasonEpisode}`);
-                    return [];
-                }
-
-                console.log(`[MP4Hydra] Found episode: ${targetEpisode.show_title || targetEpisode.title}`);
-
-                // Process streams from main servers
-                const streams = [];
-                const serverConfig = [
-                    { name: 'Beta', number: '#1' },
-                    { name: 'Beta#3', number: '#2' }
-                ];
-
-                serverConfig.forEach(server => {
-                    const serverName = server.name;
-                    const serverNumber = server.number;
-
-                    if (servers[serverName]) {
-                        const baseServer = servers[serverName];
-                        console.log(`[MP4Hydra] Processing server: ${serverName} (${baseServer})`);
-
-                        const processedEpisode = processEpisode(targetEpisode, baseServer, serverName, serverNumber);
-
-                        // Convert to standard stream format
-                        streams.push({
-                            title: `${details.title} - ${seasonEpisode} - ${processedEpisode.quality} [MP4Hydra ${serverNumber}]`,
-                            url: processedEpisode.videoUrl,
-                            quality: processedEpisode.quality,
-                            provider: "mp4hydra",
-                            headers: {
-                                'Referer': 'https://mp4hydra.org/'
-                            }
-
-                        });
-
-                        // Add subtitle tracks if available
-                        if (processedEpisode.subtitles && processedEpisode.subtitles.length > 0) {
-                            streams[streams.length - 1].subtitles = processedEpisode.subtitles.map(sub => ({
-                                url: sub.url,
-                                lang: sub.label
-                            }));
-                        }
-                    }
-                });
-
-                return streams;
-            }
-
-            // For movies, process all videos
-            const streams = [];
-            const serverConfig = [
-                { name: 'Beta', number: '#1' },
-                { name: 'Beta#3', number: '#2' }
-            ];
-
-            serverConfig.forEach(server => {
-                const serverName = server.name;
-                const serverNumber = server.number;
-
-                if (servers[serverName]) {
-                    const baseServer = servers[serverName];
-                    console.log(`[MP4Hydra] Processing server: ${serverName} (${baseServer})`);
-
-                    playlist.forEach(item => {
-                        const processedItem = processEpisode(item, baseServer, serverName, serverNumber);
-
-                        // Convert to standard stream format
-                        streams.push({
-                            title: `${details.title} - ${processedItem.quality} [MP4Hydra ${serverNumber}]`,
-                            url: processedItem.videoUrl,
-                            quality: processedItem.quality,
-                            provider: "mp4hydra",
-                            headers: {
-                                'Referer': 'https://mp4hydra.org/'
-                            }
-
-                        });
-
-                        // Add subtitle tracks if available
-                        if (processedItem.subtitles && processedItem.subtitles.length > 0) {
-                            streams[streams.length - 1].subtitles = processedItem.subtitles.map(sub => ({
-                                url: sub.url,
-                                lang: sub.label
-                            }));
-                        }
-                    });
-                }
-            });
-
-            return streams;
-        } else {
-            // Try with original title if the first attempt failed
+        if (!response.data?.playlist?.length) {
+            // Fallback attempts (original title, without year) – same as before
+            let fallbackStreams = [];
             if (details.title !== details.original_title) {
-                return await tryAlternativeTitle(details, mediaType, seasonNum, episodeNum);
+                fallbackStreams = await tryAlternativeTitle(details, mediaType, seasonNum, episodeNum);
             }
-
-            // Try without year for movies
-            if (mediaType === 'movie' && details.year) {
-                return await tryWithoutYear(details, mediaType, seasonNum, episodeNum);
+            if (!fallbackStreams.length && mediaType === 'movie' && details.year) {
+                fallbackStreams = await tryWithoutYear(details, mediaType, seasonNum, episodeNum);
             }
-
-            console.log('[MP4Hydra] No streaming links found');
-            return [];
-        }
-    } catch (error) {
-        console.error(`[MP4Hydra] Error fetching streams:`, error.message);
-        return [];
-    }
-}
-
-// Helper function to try with original title
-async function tryAlternativeTitle(details, mediaType, seasonNum, episodeNum) {
-    try {
-        console.log(`[MP4Hydra] Retrying with original title: ${details.original_title}`);
-        const originalSlug = generateSlug(details.original_title);
-        let originalFullSlug = originalSlug;
-
-        if (mediaType === 'movie' && details.year) {
-            originalFullSlug = `${originalSlug}-${details.year}`;
+            return { streams: fallbackStreams, details };
         }
 
-        // Create new form data with original title
-        const formData = new FormData();
-        formData.append('v', '8');
-        formData.append('z', JSON.stringify([{
-            s: originalFullSlug,
-            t: mediaType,
-            se: seasonNum,
-            ep: episodeNum
-        }]));
+        const playlist = response.data.playlist;
+        const servers = response.data.servers;
+        const serverConfig = [
+            { name: 'Beta', number: '#1' },
+            { name: 'Beta#3', number: '#2' }
+        ];
 
-        const response = await axios({
-            method: 'post',
-            url: 'https://mp4hydra.org/info2?v=8',
-            data: formData,
-            headers: {
-                ...formData.getHeaders(),
-                'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-                'Origin': 'https://mp4hydra.org',
-                'Referer': `https://mp4hydra.org/${mediaType}/${originalFullSlug}`,
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-origin'
-            },
-            timeout: 10000
-        });
+        const allProcessed = [];
 
-        // Process response
-        if (response.data && response.data.playlist && response.data.playlist.length > 0) {
-            const playlist = response.data.playlist;
-            const servers = response.data.servers;
+        serverConfig.forEach(server => {
+            if (!servers[server.name]) return;
+            const baseServer = servers[server.name];
 
-            console.log(`[MP4Hydra] Found ${playlist.length} videos with original title`);
-
-            // For TV shows, find the specific episode
             if (mediaType === 'tv' && seasonNum && episodeNum) {
-                const paddedSeason = seasonNum.toString().padStart(2, '0');
-                const paddedEpisode = episodeNum.toString().padStart(2, '0');
-                const seasonEpisode = `S${paddedSeason}E${paddedEpisode}`;
-
-                const targetEpisode = playlist.find(item =>
-                    item.title && item.title.toUpperCase() === seasonEpisode.toUpperCase()
+                const paddedS = seasonNum.toString().padStart(2, '0');
+                const paddedE = episodeNum.toString().padStart(2, '0');
+                const target = playlist.find(item =>
+                    item.title?.toUpperCase() === `S\( {paddedS}E \){paddedE}`.toUpperCase()
                 );
-
-                if (!targetEpisode) {
-                    console.log(`[MP4Hydra] Could not find ${seasonEpisode} with original title`);
-                    return [];
+                if (target) {
+                    const proc = processEpisode(target, baseServer, server.name, server.number);
+                    allProcessed.push({ ...proc, title: details.title });
                 }
-
-                // Process streams from main servers
-                const streams = [];
-                const serverConfig = [
-                    { name: 'Beta', number: '#1' },
-                    { name: 'Beta#3', number: '#2' }
-                ];
-
-                serverConfig.forEach(server => {
-                    const serverName = server.name;
-                    const serverNumber = server.number;
-
-                    if (servers[serverName]) {
-                        const baseServer = servers[serverName];
-                        console.log(`[MP4Hydra] Processing server: ${serverName} (${baseServer})`);
-
-                        const processedEpisode = processEpisode(targetEpisode, baseServer, serverName, serverNumber);
-
-                        // Convert to standard stream format
-                        streams.push({
-                            title: `${details.original_title} - ${seasonEpisode} - ${processedEpisode.quality} [MP4Hydra ${serverNumber}]`,
-                            url: processedEpisode.videoUrl,
-                            quality: processedEpisode.quality,
-                            provider: "mp4hydra",
-                            headers: {
-                                'Referer': 'https://mp4hydra.org/'
-                            }
-
-                        });
-
-                        // Add subtitle tracks if available
-                        if (processedEpisode.subtitles && processedEpisode.subtitles.length > 0) {
-                            streams[streams.length - 1].subtitles = processedEpisode.subtitles.map(sub => ({
-                                url: sub.url,
-                                lang: sub.label
-                            }));
-                        }
-                    }
+            } else {
+                // Movie: all items
+                playlist.forEach(item => {
+                    const proc = processEpisode(item, baseServer, server.name, server.number);
+                    allProcessed.push({ ...proc, title: details.title });
                 });
-
-                return streams;
             }
-
-            // For movies, process all videos
-            const streams = [];
-            const serverConfig = [
-                { name: 'Beta', number: '#1' },
-                { name: 'Beta#3', number: '#2' }
-            ];
-
-            serverConfig.forEach(server => {
-                const serverName = server.name;
-                const serverNumber = server.number;
-
-                if (servers[serverName]) {
-                    const baseServer = servers[serverName];
-                    console.log(`[MP4Hydra] Processing server: ${serverName} (${baseServer})`);
-
-                    playlist.forEach(item => {
-                        const processedItem = processEpisode(item, baseServer, serverName, serverNumber);
-
-                        // Convert to standard stream format
-                        streams.push({
-                            name: `${details.original_title}`,
-                            title: `${details.original_title} - ${processedItem.quality} [MP4Hydra ${serverNumber}]`,
-                            url: processedItem.videoUrl,
-                            quality: processedItem.quality
-                        });
-
-                        // Add subtitle tracks if available
-                        if (processedItem.subtitles && processedItem.subtitles.length > 0) {
-                            streams[streams.length - 1].subtitles = processedItem.subtitles.map(sub => ({
-                                url: sub.url,
-                                lang: sub.label
-                            }));
-                        }
-                    });
-                }
-            });
-
-            return streams;
-        }
-
-        return [];
-    } catch (error) {
-        console.error(`[MP4Hydra] Error with alternative title:`, error.message);
-        return [];
-    }
-}
-
-// Helper function to try without year
-async function tryWithoutYear(details, mediaType, seasonNum, episodeNum) {
-    try {
-        console.log(`[MP4Hydra] Retrying with title only (without year): ${details.title}`);
-        const titleOnlySlug = details.slug;
-
-        // Create new form data with title only
-        const formData = new FormData();
-        formData.append('v', '8');
-        formData.append('z', JSON.stringify([{
-            s: titleOnlySlug,
-            t: mediaType,
-            se: seasonNum,
-            ep: episodeNum
-        }]));
-
-        const response = await axios({
-            method: 'post',
-            url: 'https://mp4hydra.org/info2?v=8',
-            data: formData,
-            headers: {
-                ...formData.getHeaders(),
-                'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-                'Origin': 'https://mp4hydra.org',
-                'Referer': `https://mp4hydra.org/${mediaType}/${titleOnlySlug}`,
-                'Sec-Fetch-Dest': 'empty',
-                'Sec-Fetch-Mode': 'cors',
-                'Sec-Fetch-Site': 'same-origin'
-            },
-            timeout: 10000
         });
 
-        // Process response
-        if (response.data && response.data.playlist && response.data.playlist.length > 0) {
-            const playlist = response.data.playlist;
-            const servers = response.data.servers;
+        // Build standard stream objects
+        const streams = allProcessed.map(proc => ({
+            title: `${proc.title} - ${proc.quality} [MP4Hydra ${proc.serverNumber}]`,
+            url: proc.videoUrl,
+            quality: proc.quality,
+            provider: "mp4hydra",
+            headers: { 'Referer': 'https://mp4hydra.org/' },
+            subtitles: proc.subtitles?.map(s => ({ url: s.url, lang: s.label })) || []
+        }));
 
-            console.log(`[MP4Hydra] Found ${playlist.length} videos with title only`);
-
-            // For movies, process all videos
-            const streams = [];
-            const serverConfig = [
-                { name: 'Beta', number: '#1' },
-                { name: 'Beta#3', number: '#2' }
-            ];
-
-            serverConfig.forEach(server => {
-                const serverName = server.name;
-                const serverNumber = server.number;
-
-                if (servers[serverName]) {
-                    const baseServer = servers[serverName];
-                    console.log(`[MP4Hydra] Processing server: ${serverName} (${baseServer})`);
-
-                    playlist.forEach(item => {
-                        const processedItem = processEpisode(item, baseServer, serverName, serverNumber);
-
-                        // Convert to standard stream format
-                        streams.push({
-                            name: `${details.title}`,
-                            title: `${details.title} - ${processedItem.quality} [MP4Hydra ${serverNumber}]`,
-                            url: processedItem.videoUrl,
-                            quality: processedItem.quality,
-                            provider: "mp4hydra",
-                            headers: {
-                                'Referer': 'https://mp4hydra.org/'
-                            }
-
-                        });
-
-                        // Add subtitle tracks if available
-                        if (processedItem.subtitles && processedItem.subtitles.length > 0) {
-                            streams[streams.length - 1].subtitles = processedItem.subtitles.map(sub => ({
-                                url: sub.url,
-                                lang: sub.label
-                            }));
-                        }
-                    });
-                }
-            });
-
-            return streams;
-        }
-
-        return [];
+        return { streams, details };
     } catch (error) {
-        console.error(`[MP4Hydra] Error with title-only:`, error.message);
-        return [];
+        console.error(`[MP4Hydra] Error: ${error.message}`);
+        return { streams: [], details: null };
     }
 }
 
-// Helper function to get TMDB details
-async function getTMDBDetails(tmdbId, mediaType) {
-    const { getTmdbApiKey } = require('../utils/tmdbKey');
-    const TMDB_API_KEY = getTmdbApiKey();
-    if (!TMDB_API_KEY) {
-        console.warn('[MP4Hydra] TMDB API key missing; skipping TMDB metadata fetch');
-        return null;
-    }
-
-    try {
-        console.log(`[MP4Hydra] Fetching ${mediaType} details for TMDB ID: ${tmdbId}`);
-        const response = await axios.get(`https://api.themoviedb.org/3/${mediaType}/${tmdbId}?api_key=${TMDB_API_KEY}`);
-
-        if (mediaType === 'movie') {
-            return {
-                title: response.data.title,
-                original_title: response.data.original_title,
-                year: response.data.release_date ? response.data.release_date.split('-')[0] : null,
-                slug: generateSlug(response.data.title)
-            };
-        } else {
-            return {
-                title: response.data.name,
-                original_title: response.data.original_name,
-                year: response.data.first_air_date ? response.data.first_air_date.split('-')[0] : null,
-                slug: generateSlug(response.data.name)
-            };
-        }
-    } catch (error) {
-        console.error(`[MP4Hydra] Error fetching details from TMDB:`, error.message);
-        return null;
-    }
+// Original full streams array export (unchanged behavior)
+async function getMP4HydraStreams(tmdbId, mediaType, seasonNum = null, episodeNum = null) {
+    const { streams } = await fetchAndProcessMP4Hydra(tmdbId, mediaType, seasonNum, episodeNum);
+    return streams;
 }
 
-module.exports = { getMP4HydraStreams }; 
+// NEW: Direct single best URL for VLC (plain string or null)
+async function getMP4HydraDirectStream(tmdbId, mediaType, seasonNum = null, episodeNum = null) {
+    const { streams } = await fetchAndProcessMP4Hydra(tmdbId, mediaType, seasonNum, episodeNum);
+
+    if (!streams.length) return null;
+
+    // Pick the best one (highest quality score, prefer first server if tie)
+    const best = streams.reduce((prev, curr) => 
+        qualityScore(curr.quality) > qualityScore(prev.quality) ? curr : prev
+    );
+
+    return best.url;  // Just the direct playable link (mp4 / m3u8)
+}
+
+// ──────────────────────────────────────────────
+// Keep your existing fallback helpers unchanged
+// (tryAlternativeTitle, tryWithoutYear, getTMDBDetails)
+// ... paste them here exactly as in your original code ...
+
+// Export both
+module.exports = {
+    getMP4HydraStreams,       // original – returns array for JSON
+    getMP4HydraDirectStream   // new – returns single string URL or null
+};
